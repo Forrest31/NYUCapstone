@@ -1,0 +1,288 @@
+---
+title: "Capstone_Feb_2022"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE, warning=FALSE, message = FALSE, echo = FALSE, results = FALSE, fig.show='hide'}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import all libraries
+
+```{r Library Import}
+library(readr)
+library(readxl)
+library(skimr)
+library(dplyr)
+library(Metrics)
+library(data.table)
+library(caret)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+```
+
+
+```{r Import and Review Data}
+# Import source data as pulled with SQL from core data sources; does not include congestion variable at this stage
+
+flights_orig<- read_excel("DataDump_Full_v5.xlsx")
+
+flights <- flights_orig[c("mins_flight120nmtoaldt",
+                          "Airline_Categorisation",
+                          "At120NM_Event",
+                          "At120NM_Time",
+                          "DC_120NMTime",
+                          "eWTS_Trial_Live",
+                          "Peak_Hours_120NMTime",
+                          "rwy_config_at120NM",
+                          "vis_cond_at120nm_mapped",
+                          "Hour_120NM_Time",
+                          "Wake_Vortex_Category",
+                          "RECAT_Category",
+                          "Category", 
+                          "Engine_Type_Group",
+                          "Dist_from_DXB_NM",
+                          "ALDT")]
+
+#skim(flights) # initial data review, comment out
+
+#distance showing up as factor but should be numeric
+flights$Dist_from_DXB_NM = as.numeric(flights$Dist_from_DXB_NM)
+
+#remove entries where distance is null (<1% of dataset)
+flights = flights[!is.na(flights$Dist_from_DXB_NM),]
+
+#convert character variables to factor variables
+flights[sapply(flights,is.character)]<-lapply(flights[sapply(flights, is.character)], as.factor)
+flights$eWTS_Trial_Live<-as.factor(flights$eWTS_Trial_Live)
+
+# Adjust to look at sample or all data; comment out at the end
+# flights = head(flights, 50000)
+```
+
+
+
+Skim reviw
+```{r Review}
+#examine data
+skim(flights)
+
+```
+
+
+Remove outliers
+Note: we can either remove from both training and test, and call out in our test results (essentially saying x% is outside of the parameter of our model, and we expect x% of flights to be unpredictable in this way), or leave them in test results and also call out that we left all scenarios in
+
+```{r Remove Outliers}
+#Business intelligence says that the fastest a plane can travel 120nm is 5 mins. 
+#remove all observations whose 120 mins flight is less than 5
+
+# calculate percent of flights under 60 minutes
+flights_under_60_percent<-nrow(subset(flights, flights$mins_flight120nmtoaldt<60))/length(flights_orig$mins_flight120nmtoaldt)
+
+#we will never be able to train a model for extreme outliers so remove those as well
+
+flights<-flights[!(flights$mins_flight120nmtoaldt >=60), ]
+flights<-flights[!(flights$mins_flight120nmtoaldt < 5), ]
+```
+
+
+
+
+Additional data preparation for models (note that we prepare different datasets for different types of models: linear regression and XG Boost require categorical variables to be one-hot encoded and decision tree and random forest tree model do not want one-hot encoding):
+ - change all character variables to factor variables again
+ - one-hot encode for regression and XG Boost models
+
+```{r Data Prep}
+
+#change all character variables to factor variables
+
+flights[sapply(flights,is.character)]<-lapply(flights[sapply(flights, is.character)], as.factor)
+flights$eWTS_Trial_Live<-as.factor(flights$eWTS_Trial_Live)
+flights$Hour_120NM_Time<-as.factor(flights$Hour_120NM_Time)
+
+
+#remove POSIIXct variables because they were only needed to produce derived variables & offer no predictive value
+flights<-subset(flights, select = -c(At120NM_Time, ALDT))
+
+#one-hot encode all categorical variables
+hot_features<-c("Airline_Categorisation",
+                "At120NM_Event", 
+                "eWTS_Trial_Live",
+                "Peak_Hours_120NMTime",
+                "rwy_config_at120NM",
+                "vis_cond_at120nm_mapped",
+                "Wake_Vortex_Category", 
+                "RECAT_Category",
+                "Category",
+                "Engine_Type_Group",
+                "Hour_120NM_Time")
+
+dummies<- dummyVars( ~ Airline_Categorisation + 
+                       At120NM_Event + 
+                       eWTS_Trial_Live + 
+                       Peak_Hours_120NMTime + 
+                       rwy_config_at120NM + 
+                       vis_cond_at120nm_mapped + 
+                       Wake_Vortex_Category + 
+                       RECAT_Category + 
+                       Category + 
+                       Engine_Type_Group +
+                       Hour_120NM_Time,
+                     data = flights )
+
+flight_cat<-as.data.frame(predict(dummies, newdata = flights))
+
+#combine encoded variables with numeric variables
+hot_flights<-cbind(flights[, -c(which(colnames(flights) %in% hot_features))],flight_cat)
+
+#View(head(hot_flights))
+
+```
+
+
+```{r Training and Testing Splits based on Random Sample}
+
+# Create test and training sets - regular
+# Use 31 seed to stay consistent with Forrest
+
+smp_size = floor(.75 * nrow(flights))
+set.seed(31)
+train_ind = sample(seq_len(nrow(flights)), size = smp_size)
+flights_train = flights[train_ind, ]
+flights_test = flights[-train_ind, ]
+
+# Create test and training sets - one hot encoded
+# Use 31 seed to stay consistent with Forrest
+
+hot_flights_train = hot_flights[train_ind, ]
+hot_flights_test = hot_flights[-train_ind, ]
+
+```
+
+
+```{r Evaluation Metrics}
+
+#evaluate performance with MAE; how far on average is prediction from true value
+
+MAE<-function(actual, predicted){
+  mean(abs(actual-predicted))
+}
+
+#evaluate performance with percent of total predictions within target (3)
+target<-3
+
+Percent_within_tolerance = function(actual, predicted) {
+  sum(abs(actual-predicted) <=target)/length(actual)
+}
+```
+
+```{r Mean baseline}
+
+# calculate mean dependent variable from population
+
+mean(flights$mins_flight120nmtoaldt)
+```
+
+```{r Regression}
+
+# mutlivariable regression model
+# iterate through different feature selection and reduction based on results
+
+mutlivariable_lm <- lm(mins_flight120nmtoaldt ~  Dist_from_DXB_NM + Airline_Categorisation.UAE + At120NM_Event.EES1.NAS + At120NM_Event.ENR1.NAS + At120NM_Event.EST1.NAS + `Peak_Hours_120NMTime.Off-Peak Hours` + eWTS_Trial_Live.1 + vis_cond_at120nm_mapped.Mediocre + vis_cond_at120nm_mapped.Poor + Wake_Vortex_Category.M + Wake_Vortex_Category.H + Wake_Vortex_Category.J + `rwy_config_at120NM.30R ARR 30L DEP` + `rwy_config_at120NM.Dual Runway 12` + `rwy_config_at120NM.Dual Runway 30` + `rwy_config_at120NM.Single Runway 12L`+ `rwy_config_at120NM.Single Runway 12R` + `rwy_config_at120NM.Single Runway 30L`, data=hot_flights_train)
+summary(mutlivariable_lm)
+
+#predict dependent variable with model (results in results table below)
+
+lm_mv_prediction = predict(mutlivariable_lm, newdata = hot_flights_test)
+
+
+```
+
+
+```{r Decision Tree}
+# training a model on the data using recursive partitioning 
+# (basic numeric decision tree)
+# iterate through complexity parameter
+
+reg_tree_model<-rpart(mins_flight120nmtoaldt ~., data = flights_train, cp=0.009)
+rpart.plot(reg_tree_model, digits = 1)
+minute_predict<-predict(reg_tree_model, flights_test)
+```
+
+
+
+```{r Result Table 1 Data Frame}
+# Create an data frame to store results
+
+results <- data.frame(matrix(ncol = 6, nrow = 0))
+names(results) <- c("Model", "Correlation", "MAE", "Relative Error", "RMSE", "Percent_in_tolerance")
+
+#create vector of difference between predictions and actuals
+avg_land<-mean(flights_train$mins_flight120nmtoaldt)
+avg_prediction<-rep(avg_land, length(flights_test$mins_flight120nmtoaldt))
+
+#the correlation between the predicted and actual quality values can gauge performance
+#measure how strongly the predictions are related to true value; not a measure of how far off the predictions were from true values.
+
+results[nrow(results) +1, ]<-list(Model = "Average of Actuals",
+                                  Correlation = round(cor(avg_prediction,flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(avg_prediction, flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(avg_prediction, flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(avg_prediction, flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(flights_test$mins_flight120nmtoaldt, avg_prediction)*100,1))
+
+
+results[nrow(results) +1, ]<-list(Model = "Linear Regression - Multi-Variable",
+                                  Correlation = round(cor(lm_mv_prediction,hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(hot_flights_test$mins_flight120nmtoaldt, lm_mv_prediction)*100,1))
+                                  
+        
+results[nrow(results) +1, ]<-list(Model = "Decision Tree",
+                                  Correlation = round(cor(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(minute_predict,flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(flights_test$mins_flight120nmtoaldt, minute_predict)*100,1))
+
+
+results
+```
+
+
+
+
+
+
+```{r Set Baseline, Check Origin Distances}
+#remove outliers to make comparison fair
+
+
+baseline_flights = flights_orig
+baseline_flights$Dist_from_DXB_NM = as.numeric(baseline_flights$Dist_from_DXB_NM)
+baseline_flights = baseline_flights[!is.na(baseline_flights$Dist_from_DXB_NM),]
+check<-subset(baseline_flights, baseline_flights$Dist_from_DXB_NM==max(baseline_flights$Dist_from_DXB_NM)) 
+
+baseline_flights<-baseline_flights[!(baseline_flights$mins_flight120nmtoaldt <5), ] 
+baseline_flights<-baseline_flights[!(baseline_flights$mins_flight120nmtoaldt >=60), ]
+
+#just pull calculated column of estimated vs. actual time
+baseline_flights = flights_orig[c("Act_vs_ELDT")]
+baseline_flights = subset(baseline_flights, baseline_flights$Act_vs_ELDT!="NULL") #remove null
+baseline_flights$Act_vs_ELDT = as.numeric(baseline_flights$Act_vs_ELDT) #turn numeric
+
+# remove any estimates over 120 minutes off, as outliers or data errors
+baseline_flights = subset(baseline_flights, abs(baseline_flights$Act_vs_ELDT)<=120) 
+
+
+mean(abs(baseline_flights$Act_vs_ELDT))
+
+sum(abs(baseline_flights$Act_vs_ELDT)<=3)/length(baseline_flights$Act_vs_ELDT)*100
+
+```
