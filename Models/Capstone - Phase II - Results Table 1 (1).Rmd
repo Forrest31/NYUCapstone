@@ -1,0 +1,293 @@
+---
+title: "Capstone_Feb_2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import all libraries
+
+```{r Library Import}
+library(readr)
+library(readxl)
+library(skimr)
+library(dplyr)
+library(Metrics)
+library(randomForest)
+library(data.table)
+library(caret)
+library(ggplot2)
+
+library(rpart)
+library(rpart.plot)
+```
+
+
+Import and review data
+
+test = flights_orig[c("Origin","Dist_from_DXB_NM")]
+test$Dist_from_DXB_NM = as.numeric(test$Dist_from_DXB_NM)
+unique(test[is.na(test$Dist_from_DXB_NM),])
+
+
+```{r Import and Review Data}
+flights_orig<- read_excel("DataDump_Full_v5.xlsx")
+
+flights <- flights_orig[c("mins_flight120nmtoaldt",
+                          "Airline_Categorisation",
+                          "At120NM_Event",
+                          "At120NM_Time",
+                          "DC_120NMTime",
+                          "eWTS_Trial_Live",
+                          "Peak_Hours_120NMTime",
+                          "rwy_config_at120NM",
+                          "vis_cond_at120nm_mapped",
+                          "Hour_120NM_Time",
+                          "Wake_Vortex_Category",
+                          "RECAT_Category",
+                          "Category", 
+                          "Engine_Type_Group",
+                          "Congestion_Wake_Super", 
+                          "Congestion_Wake_Heavy",
+                          "Congestion_Wake_Medium",
+                          "Congestion_Wake_Light",
+                          "Congestion_Wake_Other",
+                          "Congestion_Overall",
+                          "Dist_from_DXB_NM",
+                          "ALDT")]
+
+#distance showing up as factor but should be numeric
+flights$Dist_from_DXB_NM = as.numeric(flights$Dist_from_DXB_NM)
+
+#remove entries where distance is null (<1% of dataset)
+flights = flights[!is.na(flights$Dist_from_DXB_NM),]
+
+
+#convert character variables to factor variables
+flights[sapply(flights,is.character)]<-lapply(flights[sapply(flights, is.character)], as.factor)
+flights$eWTS_Trial_Live<-as.factor(flights$eWTS_Trial_Live)
+
+
+
+# Adjust to look at sample or all data; comment out at the end
+# flights = head(flights, 50000)
+```
+
+
+Skim reviw
+```{r Review}
+#examine data
+skim(flights)
+
+```
+
+
+Remove outliers
+Note: we can either remove from both training and test, and call out in our test results (essentially saying x% is outside of the parameter of our model, and we expect x% of flights to be unpredictable in this way), or leave them in test results and also call out that we left all scenarios in
+
+```{r Remove Outliers}
+#Business intelligence says that the fastest a plane can travel 120nm is 5 mins. 
+#remove all observations whose 120 mins flight is less than 5
+
+# calculate percent of flights under 60 minutes
+flights_under_60_percent<-nrow(subset(flights, flights$mins_flight120nmtoaldt<60))/length(flights_orig$mins_flight120nmtoaldt)
+
+#we will never be able to train a model for extreme outliers so remove those as well
+#flights_orig<-flights_orig[!(flights_orig$mins_flight120nmtoaldt <5), ] #why touch the original?
+#flights_orig<-flights_orig[!(flights_orig$mins_flight120nmtoaldt >=60), ] #why touch the original?
+flights<-flights[!(flights$mins_flight120nmtoaldt >=60), ]
+flights<-flights[!(flights$mins_flight120nmtoaldt < 5), ]
+
+```
+
+
+
+```{r Day of the Week Feature}
+
+# Add day of the week: want the day of the week to correspond to when at 120nm
+flights$day_of_the_week = as.POSIXlt(flights$At120NM_Time)$wday
+flights$day_of_the_week = as.character(flights$day_of_the_week)
+
+
+# Add for visualization
+# flights$day_and_hour = paste(flights$day_of_the_week, flights$Hour_120NM_Time)
+```
+
+
+```{r correlation}
+
+# Check correlation between overall congestion and arrival time
+cor(flights$Congestion_Overall, flights$mins_flight120nmtoaldt)
+
+```
+
+
+Additional data preparation for models (note that we prepare different datasets for different types of models: for example, XG Boost and random forest tree models; the only difference is that XG Boost requires categorical variables to be one-hot encoded while random forest models do not want one-hot encoding):
+ - change all character variables to factor variables again
+ - one-hot encode for regression and XG Boost models
+
+```{r Data Prep}
+
+#change all character variables to factor variables
+
+flights[sapply(flights,is.character)]<-lapply(flights[sapply(flights, is.character)], as.factor)
+flights$eWTS_Trial_Live<-as.factor(flights$eWTS_Trial_Live)
+flights$Hour_120NM_Time<-as.factor(flights$Hour_120NM_Time)
+
+#remove POSIIXct variables because they were only needed to produce derived variables & offer no predictive value
+flights<-subset(flights, select = -c(At120NM_Time, ALDT))
+
+#one-hot encode all categorical variables
+hot_features<-c("Airline_Categorisation",
+                "At120NM_Event", 
+                "eWTS_Trial_Live",
+                "Peak_Hours_120NMTime",
+                "rwy_config_at120NM",
+                "vis_cond_at120nm_mapped",
+                "Wake_Vortex_Category", 
+                "RECAT_Category",
+                "Category",
+                "Engine_Type_Group",
+                "Hour_120NM_Time",
+                "day_of_the_week")
+
+dummies<- dummyVars( ~ Airline_Categorisation + 
+                       At120NM_Event + 
+                       eWTS_Trial_Live + 
+                       Peak_Hours_120NMTime + 
+                       rwy_config_at120NM + 
+                       vis_cond_at120nm_mapped + 
+                       Wake_Vortex_Category + 
+                       RECAT_Category + 
+                       Category + 
+                       Engine_Type_Group + 
+                       Hour_120NM_Time +
+                       day_of_the_week, 
+                       data = flights )
+
+flight_cat<-as.data.frame(predict(dummies, newdata = flights))
+
+#combine encoded variables with numeric variables
+hot_flights<-cbind(flights[, -c(which(colnames(flights) %in% hot_features))],flight_cat)
+
+#View(head(hot_flights))
+
+```
+
+
+```{r Training and Testing Splits based on Random Sample}
+# Create test and training sets - regular
+# Use 31 seed to stay consistent with Forrest
+
+smp_size = floor(.75 * nrow(flights))
+set.seed(31)
+train_ind = sample(seq_len(nrow(flights)), size = smp_size)
+flights_train = flights[train_ind, ]
+flights_test = flights[-train_ind, ]
+
+# Create test and training sets - one hot encoded
+# Use 31 seed to stay consistent with Forrest
+
+hot_flights_train = hot_flights[train_ind, ]
+hot_flights_test = hot_flights[-train_ind, ]
+
+```
+
+```{r Evaluation Metrics}
+
+#evaluate performance with MAE; how far on average is prediction from true value
+MAE<-function(actual, predicted){
+  mean(abs(actual-predicted))
+}
+
+#evaluate performance with percent of total predictions within target (3)
+target<-3
+
+Percent_within_tolerance = function(actual, predicted) {
+  sum(abs(actual-predicted) <=target)/length(actual)
+}
+
+```
+
+
+
+
+```{r Simple Congestion Regression}
+
+congest_lm <- lm(mins_flight120nmtoaldt ~ Congestion_Overall, data=flights_train)
+summary(congest_lm)
+
+lm_prediction = predict(congest_lm, newdata = flights_test)
+
+```
+
+
+```{r Regression}
+
+mutlivariable_lm <- lm(mins_flight120nmtoaldt ~  Congestion_Overall + Dist_from_DXB_NM + Airline_Categorisation.UAE + At120NM_Event.EES1.NAS + At120NM_Event.ENR1.NAS + At120NM_Event.EST1.NAS + `Peak_Hours_120NMTime.Off-Peak Hours` + eWTS_Trial_Live.1 + vis_cond_at120nm_mapped.Mediocre + vis_cond_at120nm_mapped.Poor + Wake_Vortex_Category.M + Wake_Vortex_Category.H + Wake_Vortex_Category.J + `rwy_config_at120NM.30R ARR 30L DEP` + `rwy_config_at120NM.Dual Runway 12` + `rwy_config_at120NM.Dual Runway 30` + `rwy_config_at120NM.Single Runway 12R` + `rwy_config_at120NM.Single Runway 30L` + day_of_the_week.0 + day_of_the_week.1 + day_of_the_week.2 + day_of_the_week.3 + day_of_the_week.4 + day_of_the_week.5, data=hot_flights_train)
+summary(mutlivariable_lm)
+
+lm_mv_prediction = predict(mutlivariable_lm, newdata = hot_flights_test)
+
+
+```
+
+
+```{r Decision Tree}
+# training a model on the data using recursive partitioning 
+# (basic numeric decision tree)
+
+reg_tree_model<-rpart(mins_flight120nmtoaldt ~., data = flights_train, cp=0.009)
+rpart.plot(reg_tree_model, digits = 1)
+minute_predict<-predict(reg_tree_model, flights_test)
+```
+
+
+```{r Result Table 1 Data Frame}
+# Create an data frame to store results
+
+results <- data.frame(matrix(ncol = 6, nrow = 0))
+names(results) <- c("Model", "Correlation", "MAE", "Relative Error", "RMSE", "% in Target")
+
+#create vector of difference between predictions and actuals
+avg_land<-mean(flights_train$mins_flight120nmtoaldt)
+avg_prediction<-rep(avg_land, length(flights_test$mins_flight120nmtoaldt))
+
+#the correlation between the predicted and actual quality values can gauge performance
+#measure how strongly the predictions are related to true value; not a measure of how far off the predictions were from true values.
+
+results[nrow(results) +1, ]<-list(Model = "Average of Actuals",
+                                  Correlation = round(cor(avg_prediction,flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(avg_prediction, flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(avg_prediction, flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(avg_prediction, flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(flights_test$mins_flight120nmtoaldt, avg_prediction)*100,1))
+
+results[nrow(results) +1, ]<-list(Model = "Linear Regression - Pure Congestion",
+                                  Correlation = round(cor(lm_prediction,hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(lm_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(lm_prediction, hot_flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(lm_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_within_tolerance = round(Percent_within_tolerance(hot_flights_test$mins_flight120nmtoaldt, lm_prediction)*100,1))
+
+                                
+results[nrow(results) +1, ]<-list(Model = "Linear Regression - Multi-Variable",
+                                  Correlation = round(cor(lm_mv_prediction,hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(lm_mv_prediction, hot_flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(hot_flights_test$mins_flight120nmtoaldt, lm_mv_prediction)*100,1))
+                              
+                                  
+        
+results[nrow(results) +1, ]<-list(Model = "Decision Tree",
+                                  Correlation = round(cor(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  MAE =round(MAE(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  MAPE =round(mape(minute_predict,flights_test$mins_flight120nmtoaldt)*100,1),
+                                  RMSE =round(rmse(minute_predict,flights_test$mins_flight120nmtoaldt),1),
+                                  Percent_in_tolerance = round(Percent_within_tolerance(flights_test$mins_flight120nmtoaldt, minute_predict)*100,1))
+
+results
+```
